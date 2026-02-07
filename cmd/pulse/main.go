@@ -49,13 +49,13 @@ inspired by Linear. Manage issues, cycles, and team velocity.`,
 				cancel()
 			}()
 
-			// Ensure data directory exists
-			if err := os.MkdirAll(dataDir, 0755); err != nil {
-				return fmt.Errorf("failed to create data dir: %w", err)
+			// Start Pulse server with SQLite persistence
+			pulseServer, err := server.NewServer(addr, dataDir)
+			if err != nil {
+				return fmt.Errorf("failed to create pulse server: %w", err)
 			}
+			defer pulseServer.Close()
 
-			// Start Pulse server with in-memory workspace storage
-			pulseServer := server.NewServer(addr)
 			if err := pulseServer.Start(ctx); err != nil {
 				return fmt.Errorf("failed to start pulse server: %w", err)
 			}

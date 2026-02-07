@@ -5,99 +5,50 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
-	"sync"
 	"time"
+
+	"github.com/pulse/pm/internal/db"
 )
 
 // Server represents the Pulse web server
 type Server struct {
-	addr       string
-	mux        *http.ServeMux
-	server     *http.Server
-	workspaces map[string]*Workspace
-	mu         sync.RWMutex
-}
-
-// Workspace represents a project workspace
-type Workspace struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Issues      map[string]*Issue `json:"issues"`
-	Columns     []Column          `json:"columns"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-}
-
-// Issue represents a single issue/task
-type Issue struct {
-	ID          string            `json:"id"`
-	Title       string            `json:"title"`
-	Description string            `json:"description"`
-	Status      string            `json:"status"`
-	Priority    int               `json:"priority"` // 0=No priority, 1=Urgent, 2=High, 3=Medium, 4=Low
-	AssigneeID string            `json:"assignee_id"`
-	Labels      []string          `json:"labels"`
-	Estimate    int               `json:"estimate"` // Story points
-	CycleID     string            `json:"cycle_id"`
-	ParentID    string            `json:"parent_id"`
-	SubIssues   []string          `json:"sub_issues"`
-	CreatedAt   time.Time         `json:"created_at"`
-	UpdatedAt   time.Time         `json:"updated_at"`
-	CompletedAt *time.Time        `json:"completed_at"`
-}
-
-// Cycle represents a time-boxed iteration
-type Cycle struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	StartDate time.Time  `json:"start_date"`
-	EndDate   time.Time  `json:"end_date"`
-	IssueIDs  []string   `json:"issue_ids"`
-	Completed int        `json:"completed"` // Number of completed issues
-	Progress  float64    `json:"progress"`  // 0-100
-}
-
-// Column represents a workflow column
-type Column struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Order  int    `json:"order"`
-	Color  string `json:"color"`
-}
-
-// Team represents a team
-type Team struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	Members   []string `json:"members"`
-	Workspace string   `json:"workspace"`
-}
-
-// VelocityMetrics tracks team velocity
-type VelocityMetrics struct {
-	CycleID           string    `json:"cycle_id"`
-	PointsPlanned     int       `json:"points_planned"`
-	PointsCompleted   int       `json:"points_completed"`
-	CycleTime         float64   `json:"cycle_time_hours"`
-	LeadTime          float64   `json:"lead_time_hours"`
-	BugCount          int       `json:"bug_count"`
-	IssuesCreated     int       `json:"issues_created"`
-	IssuesCompleted   int       `json:"issues_completed"`
-	AverageEstimate   float64   `json:"average_estimate"`
-	CompletionRate    float64   `json:"completion_rate"` // 0-100
+	addr             string
+	mux              *http.ServeMux
+	server           *http.Server
+	db               *db.DB
+	workspaceRepo    *db.WorkspaceRepository
+	issueRepo        *db.IssueRepository
+	cycleRepo        *db.CycleRepository
 }
 
 // NewServer creates a new Pulse server
-func NewServer(addr string) *Server {
+func NewServer(addr, dataDir string) (*Server, error) {
+	// Ensure data directory exists
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data dir: %w", err)
+	}
+
+	database, err := db.New(dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	if err := database.Migrate(); err != nil {
+		return nil, fmt.Errorf("failed to run migrations: %w", err)
+	}
+
 	s := &Server{
-		addr:       addr,
-		mux:        http.NewServeMux(),
-		workspaces: make(map[string]*Workspace),
+		addr:             addr,
+		mux:              http.NewServeMux(),
+		db:               database,
+		workspaceRepo:    db.NewWorkspaceRepository(database),
+		issueRepo:        db.NewIssueRepository(database),
+		cycleRepo:        db.NewCycleRepository(database),
 	}
 	s.registerRoutes()
-	return s
+	return s, nil
 }
 
 func (s *Server) registerRoutes() {
@@ -121,43 +72,42 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":    "ok",
 		"timestamp": time.Now().Format(time.RFC3339),
 		"version":   "1.0.0",
+		"database":  s.db.Path(),
 	})
 }
 
 func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		s.mu.RLock()
-		workspaces := make([]*Workspace, 0, len(s.workspaces))
-		for _, ws := range s.workspaces {
-			workspaces = append(workspaces, ws)
+		workspaces, err := s.workspaceRepo.List()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to list workspaces: %v", err), http.StatusInternalServerError)
+			return
 		}
-		s.mu.RUnlock()
 		jsonResponse(w, workspaces)
 
 	case http.MethodPost:
 		var req struct {
 			Name        string `json:"name"`
 			Description string `json:"description"`
+			Settings    string `json:"settings"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
 
-		ws := &Workspace{
-			ID:          generateID(),
+		ws := &db.Workspace{
+			ID:          fmt.Sprintf("ws_%d", time.Now().UnixNano()),
 			Name:        req.Name,
 			Description: req.Description,
-			Issues:      make(map[string]*Issue),
-			Columns:     defaultColumns(),
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
+			Settings:    req.Settings,
 		}
 
-		s.mu.Lock()
-		s.workspaces[ws.ID] = ws
-		s.mu.Unlock()
+		if err := s.workspaceRepo.Create(ws); err != nil {
+			http.Error(w, fmt.Sprintf("failed to create workspace: %v", err), http.StatusInternalServerError)
+			return
+		}
 
 		jsonResponse(w, ws)
 	}
@@ -165,11 +115,13 @@ func (s *Server) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 	id := filepath.Base(r.URL.Path)
-	s.mu.RLock()
-	ws, ok := s.workspaces[id]
-	s.mu.RUnlock()
 
-	if !ok {
+	ws, err := s.workspaceRepo.GetByID(id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get workspace: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if ws == nil {
 		http.Error(w, "workspace not found", http.StatusNotFound)
 		return
 	}
@@ -185,22 +137,28 @@ func (s *Server) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		s.mu.Lock()
 		if name, ok := req["name"].(string); ok {
 			ws.Name = name
 		}
 		if desc, ok := req["description"].(string); ok {
 			ws.Description = desc
 		}
-		ws.UpdatedAt = time.Now()
-		s.mu.Unlock()
+		if settings, ok := req["settings"].(string); ok {
+			ws.Settings = settings
+		}
+
+		if err := s.workspaceRepo.Update(ws); err != nil {
+			http.Error(w, fmt.Sprintf("failed to update workspace: %v", err), http.StatusInternalServerError)
+			return
+		}
 
 		jsonResponse(w, ws)
 
 	case http.MethodDelete:
-		s.mu.Lock()
-		delete(s.workspaces, id)
-		s.mu.Unlock()
+		if err := s.workspaceRepo.Delete(id); err != nil {
+			http.Error(w, fmt.Sprintf("failed to delete workspace: %v", err), http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -208,47 +166,56 @@ func (s *Server) handleWorkspace(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		// Get issues across all workspaces or filter by workspace
 		workspaceID := r.URL.Query().Get("workspace_id")
-		s.mu.RLock()
-		var issues []*Issue
-		for _, ws := range s.workspaces {
-			if workspaceID == "" || ws.ID == workspaceID {
-				for _, issue := range ws.Issues {
-					issues = append(issues, issue)
-				}
-			}
+		status := r.URL.Query().Get("status")
+
+		var limit, offset int
+		fmt.Sscanf(r.URL.Query().Get("limit"), "%d", &limit)
+		fmt.Sscanf(r.URL.Query().Get("offset"), "%d", &offset)
+
+		issues, err := s.issueRepo.List(workspaceID, status, limit, offset)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to list issues: %v", err), http.StatusInternalServerError)
+			return
 		}
-		s.mu.RUnlock()
 		jsonResponse(w, issues)
 
 	case http.MethodPost:
 		var req struct {
-			WorkspaceID string `json:"workspace_id"`
-			Title       string `json:"title"`
-			Description string `json:"description"`
-			Status      string `json:"status"`
-			Priority    int    `json:"priority"`
-			AssigneeID  string `json:"assignee_id"`
+			WorkspaceID string   `json:"workspace_id"`
+			Title       string   `json:"title"`
+			Description string   `json:"description"`
+			Status      string   `json:"status"`
+			Priority    int      `json:"priority"`
+			AssigneeID  string   `json:"assignee_id"`
 			Labels      []string `json:"labels"`
-			Estimate    int    `json:"estimate"`
+			Estimate    int      `json:"estimate"`
+			CycleID     string   `json:"cycle_id"`
+			ParentID    string   `json:"parent_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request", http.StatusBadRequest)
 			return
 		}
 
-		s.mu.RLock()
-		ws, ok := s.workspaces[req.WorkspaceID]
-		s.mu.RUnlock()
-
-		if !ok {
+		// Verify workspace exists
+		ws, err := s.workspaceRepo.GetByID(req.WorkspaceID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to verify workspace: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if ws == nil {
 			http.Error(w, "workspace not found", http.StatusNotFound)
 			return
 		}
 
-		issue := &Issue{
-			ID:          generateID(),
+		if req.Status == "" {
+			req.Status = "backlog"
+		}
+
+		issue := &db.Issue{
+			ID:          fmt.Sprintf("issue_%d", time.Now().UnixNano()),
+			WorkspaceID: req.WorkspaceID,
 			Title:       req.Title,
 			Description: req.Description,
 			Status:      req.Status,
@@ -256,14 +223,14 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 			AssigneeID:  req.AssigneeID,
 			Labels:      req.Labels,
 			Estimate:    req.Estimate,
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
+			CycleID:     req.CycleID,
+			ParentID:    req.ParentID,
 		}
 
-		s.mu.Lock()
-		ws.Issues[issue.ID] = issue
-		ws.UpdatedAt = time.Now()
-		s.mu.Unlock()
+		if err := s.issueRepo.Create(issue); err != nil {
+			http.Error(w, fmt.Sprintf("failed to create issue: %v", err), http.StatusInternalServerError)
+			return
+		}
 
 		jsonResponse(w, issue)
 	}
@@ -272,19 +239,11 @@ func (s *Server) handleIssues(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 	id := filepath.Base(r.URL.Path)
 
-	// Find the issue across all workspaces
-	s.mu.RLock()
-	var issue *Issue
-	var workspaceID string
-	for wsID, ws := range s.workspaces {
-		if i, ok := ws.Issues[id]; ok {
-			issue = i
-			workspaceID = wsID
-			break
-		}
+	issue, err := s.issueRepo.GetByID(id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get issue: %v", err), http.StatusInternalServerError)
+		return
 	}
-	s.mu.RUnlock()
-
 	if issue == nil {
 		http.Error(w, "issue not found", http.StatusNotFound)
 		return
@@ -301,7 +260,6 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		s.mu.Lock()
 		if title, ok := req["title"].(string); ok {
 			issue.Title = title
 		}
@@ -310,10 +268,6 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		}
 		if status, ok := req["status"].(string); ok {
 			issue.Status = status
-			if status == "done" {
-				now := time.Now()
-				issue.CompletedAt = &now
-			}
 		}
 		if priority, ok := req["priority"].(float64); ok {
 			issue.Priority = int(priority)
@@ -321,51 +275,209 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		if assignee, ok := req["assignee_id"].(string); ok {
 			issue.AssigneeID = assignee
 		}
-		issue.UpdatedAt = time.Now()
+		if estimate, ok := req["estimate"].(float64); ok {
+			issue.Estimate = int(estimate)
+		}
+		if cycleID, ok := req["cycle_id"].(string); ok {
+			issue.CycleID = cycleID
+		}
+		if parentID, ok := req["parent_id"].(string); ok {
+			issue.ParentID = parentID
+		}
+		if labels, ok := req["labels"].([]interface{}); ok {
+			issue.Labels = make([]string, len(labels))
+			for i, l := range labels {
+				issue.Labels[i] = l.(string)
+			}
+		}
 
-		ws := s.workspaces[workspaceID]
-		ws.UpdatedAt = time.Now()
-		s.mu.Unlock()
+		if err := s.issueRepo.Update(issue); err != nil {
+			http.Error(w, fmt.Sprintf("failed to update issue: %v", err), http.StatusInternalServerError)
+			return
+		}
 
 		jsonResponse(w, issue)
 
 	case http.MethodDelete:
-		s.mu.Lock()
-		delete(s.workspaces[workspaceID].Issues, id)
-		s.mu.Unlock()
+		if err := s.issueRepo.Delete(id); err != nil {
+			http.Error(w, fmt.Sprintf("failed to delete issue: %v", err), http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
+
+	case http.MethodPatch:
+		// Handle status-only updates
+		var req struct {
+			Status string `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if err := s.issueRepo.UpdateStatus(id, req.Status); err != nil {
+			http.Error(w, fmt.Sprintf("failed to update status: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		issue, _ := s.issueRepo.GetByID(id)
+		jsonResponse(w, issue)
 	}
 }
 
 func (s *Server) handleCycles(w http.ResponseWriter, r *http.Request) {
-	// Simplified cycle handling - cycles are stored in coordination server
-	jsonResponse(w, []interface{}{})
+	workspaceID := r.URL.Query().Get("workspace_id")
+
+	switch r.Method {
+	case http.MethodGet:
+		cycles, err := s.cycleRepo.List(workspaceID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("failed to list cycles: %v", err), http.StatusInternalServerError)
+			return
+		}
+		jsonResponse(w, cycles)
+
+	case http.MethodPost:
+		var req struct {
+			WorkspaceID string  `json:"workspace_id"`
+			Name        string  `json:"name"`
+			StartDate   *string `json:"start_date"`
+			EndDate     *string `json:"end_date"`
+			Status      string  `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+
+		cycle := &db.Cycle{
+			ID:          fmt.Sprintf("cycle_%d", time.Now().UnixNano()),
+			WorkspaceID: req.WorkspaceID,
+			Name:        req.Name,
+			Status:      req.Status,
+		}
+
+		if req.StartDate != nil {
+			t, _ := time.Parse(time.RFC3339, *req.StartDate)
+			cycle.StartDate = &t
+		}
+		if req.EndDate != nil {
+			t, _ := time.Parse(time.RFC3339, *req.EndDate)
+			cycle.EndDate = &t
+		}
+
+		if err := s.cycleRepo.Create(cycle); err != nil {
+			http.Error(w, fmt.Sprintf("failed to create cycle: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		jsonResponse(w, cycle)
+	}
 }
 
 func (s *Server) handleCycle(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "not implemented", http.StatusNotImplemented)
+	id := filepath.Base(r.URL.Path)
+
+	cycle, err := s.cycleRepo.GetByID(id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get cycle: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if cycle == nil {
+		http.Error(w, "cycle not found", http.StatusNotFound)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		jsonResponse(w, cycle)
+
+	case http.MethodPut:
+		var req map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+
+		if name, ok := req["name"].(string); ok {
+			cycle.Name = name
+		}
+		if status, ok := req["status"].(string); ok {
+			cycle.Status = status
+		}
+
+		if err := s.cycleRepo.Update(cycle); err != nil {
+			http.Error(w, fmt.Sprintf("failed to update cycle: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		jsonResponse(w, cycle)
+
+	case http.MethodDelete:
+		if err := s.cycleRepo.Delete(id); err != nil {
+			http.Error(w, fmt.Sprintf("failed to delete cycle: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	workspaceID := r.URL.Query().Get("workspace_id")
-
-	s.mu.RLock()
-	var ws *Workspace
-	for _, w := range s.workspaces {
-		if w.ID == workspaceID || workspaceID == "" {
-			ws = w
-			break
-		}
+	if workspaceID == "" {
+		workspaceID = "default"
 	}
-	s.mu.RUnlock()
 
-	if ws == nil {
-		jsonResponse(w, VelocityMetrics{})
+	// Get issue counts by status
+	statusCounts, err := s.issueRepo.CountByStatus(workspaceID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to count issues: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Calculate metrics
-	metrics := calculateMetrics(ws)
+	// Calculate velocity metrics
+	var totalPoints, completedPoints int
+	issues, _ := s.issueRepo.List(workspaceID, "", 0, 0)
+	for _, issue := range issues {
+		totalPoints += issue.Estimate
+		if issue.Status == "done" {
+			completedPoints += issue.Estimate
+		}
+	}
+
+	var bugs int
+	for _, issue := range issues {
+		for _, label := range issue.Labels {
+			if label == "bug" {
+				bugs++
+				break
+			}
+		}
+	}
+
+	totalIssues := 0
+	for _, count := range statusCounts {
+		totalIssues += count
+	}
+
+	completionRate := 0.0
+	if totalIssues > 0 {
+		completionRate = float64(statusCounts["done"]) / float64(totalIssues) * 100
+	}
+
+	metrics := map[string]interface{}{
+		"workspace_id":      workspaceID,
+		"total_issues":     totalIssues,
+		"backlog_count":    statusCounts["backlog"],
+		"todo_count":       statusCounts["todo"],
+		"in_progress_count": statusCounts["in_progress"],
+		"done_count":       statusCounts["done"],
+		"total_points":     totalPoints,
+		"completed_points": completedPoints,
+		"completion_rate":   completionRate,
+		"bug_count":        bugs,
+	}
+
 	jsonResponse(w, metrics)
 }
 
@@ -376,22 +488,25 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
+	workspaceID := r.URL.Query().Get("workspace_id")
+	issues, err := s.issueRepo.List(workspaceID, "", 0, 0)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to search issues: %v", err), http.StatusInternalServerError)
+		return
+	}
+
 	var results []interface{}
-	for _, ws := range s.workspaces {
-		for _, issue := range ws.Issues {
-			if contains(issue.Title, query) || contains(issue.Description, query) {
-				results = append(results, map[string]interface{}{
-					"type":    "issue",
-					"id":      issue.ID,
-					"title":   issue.Title,
-					"status":  issue.Status,
-					"workspace": ws.Name,
-				})
-			}
+	for _, issue := range issues {
+		if contains(issue.Title, query) || contains(issue.Description, query) {
+			results = append(results, map[string]interface{}{
+				"type":    "issue",
+				"id":      issue.ID,
+				"title":   issue.Title,
+				"status":  issue.Status,
+				"workspace": workspaceID,
+			})
 		}
 	}
-	s.mu.RUnlock()
 
 	jsonResponse(w, results)
 }
@@ -401,94 +516,14 @@ func (s *Server) handleWebUI(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, webUIHTML())
 }
 
-// Start starts the server
-func (s *Server) Start(ctx context.Context) error {
-	s.server = &http.Server{
-		Addr:    s.addr,
-		Handler: s.mux,
-	}
-
-	go func() {
-		fmt.Printf("Pulse server starting on %s\n", s.addr)
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Printf("Server error: %v\n", err)
-		}
-	}()
-
-	<-ctx.Done()
-	return s.server.Shutdown(ctx)
-}
-
-// Helper functions
-func generateID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
-}
-
-func defaultColumns() []Column {
-	return []Column{
-		{ID: "backlog", Name: "Backlog", Order: 0, Color: "#6B7280"},
-		{ID: "todo", Name: "To Do", Order: 1, Color: "#F59E0B"},
-		{ID: "in_progress", Name: "In Progress", Order: 2, Color: "#3B82F6"},
-		{ID: "done", Name: "Done", Order: 3, Color: "#10B981"},
-	}
-}
-
-func calculateMetrics(ws *Workspace) VelocityMetrics {
-	var metrics VelocityMetrics
-
-	for _, issue := range ws.Issues {
-		metrics.IssuesCreated++
-		metrics.PointsPlanned += issue.Estimate
-
-		if issue.Status == "done" && issue.CompletedAt != nil {
-			metrics.IssuesCompleted++
-			metrics.PointsCompleted += issue.Estimate
-		}
-
-		if len(issue.Labels) > 0 {
-			for _, label := range issue.Labels {
-				if label == "bug" {
-					metrics.BugCount++
-					break
-				}
-			}
-		}
-	}
-
-	if metrics.IssuesCreated > 0 {
-		metrics.CompletionRate = float64(metrics.IssuesCompleted) / float64(metrics.IssuesCreated) * 100
-	}
-	if metrics.PointsPlanned > 0 {
-		metrics.AverageEstimate = float64(metrics.PointsPlanned) / float64(metrics.IssuesCreated)
-	}
-
-	return metrics
-}
-
-func jsonResponse(w http.ResponseWriter, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
 // webUIHTML returns the web UI HTML page
 func webUIHTML() string {
 	return `<!DOCTYPE html>
 <html>
 <head>
     <title>Pulse - Project Management</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0F1117; color: #ECEFF1; }
@@ -502,6 +537,7 @@ func webUIHTML() string {
         .header h1 { font-size: 18px; font-weight: 600; }
         .btn { background: #238636; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
         .btn:hover { background: #2EA043; }
+        .btn-secondary { background: #21262D; color: #ECEFF1; border: 1px solid #30363D; }
         .board { display: flex; padding: 24px; gap: 16px; overflow-x: auto; }
         .column { min-width: 280px; background: #0D1117; border-radius: 8px; padding: 12px; }
         .column-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -521,47 +557,136 @@ func webUIHTML() string {
         .priority.low { background: #3FB950; }
         .search { background: #0D1117; border: 1px solid #30363D; padding: 8px 12px; border-radius: 6px; color: #ECEFF1; width: 240px; }
         .search:focus { outline: none; border-color: #58A6FF; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); align-items: center; justify-content: center; }
+        .modal.active { display: flex; }
+        .modal-content { background: #161B22; border-radius: 8px; padding: 24px; width: 500px; max-width: 90%; }
+        .modal-header { display: flex; justify-content: space-between; margin-bottom: 16px; }
+        .modal-title { font-size: 18px; font-weight: 600; }
+        .close-btn { background: none; border: none; color: #8B949E; cursor: pointer; font-size: 20px; }
+        .form-group { margin-bottom: 16px; }
+        .form-group label { display: block; margin-bottom: 8px; font-size: 14px; color: #8B949E; }
+        .form-group input, .form-group select, .form-group textarea { width: 100%; background: #0D1117; border: 1px solid #30363D; border-radius: 6px; padding: 8px 12px; color: #ECEFF1; font-size: 14px; }
+        .form-group input:focus, .form-group select:focus, .form-group textarea:focus { outline: none; border-color: #58A6FF; }
+        .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
+        .metrics { display: flex; gap: 24px; padding: 16px 24px; background: #161B22; border-bottom: 1px solid #30363D; }
+        .metric { text-align: center; }
+        .metric-value { font-size: 24px; font-weight: 600; color: #A371F7; }
+        .metric-label { font-size: 12px; color: #8B949E; margin-top: 4px; }
     </style>
 </head>
 <body>
     <div class="app">
         <div class="sidebar">
             <div class="logo">Pulse</div>
-            <div class="nav-item active">Board</div>
-            <div class="nav-item">Analytics</div>
-            <div class="nav-item">Cycles</div>
+            <div class="nav-item active" onclick="showBoard()">Board</div>
+            <div class="nav-item" onclick="showMetrics()">Analytics</div>
+            <div class="nav-item" onclick="showCycles()">Cycles</div>
             <div class="nav-item">Labels</div>
             <div class="nav-item">Settings</div>
         </div>
         <div class="main">
             <div class="header">
-                <h1>Project Board</h1>
-                <input type="text" class="search" placeholder="Search issues..." id="search">
-                <button class="btn" id="createBtn">+ New Issue</button>
+                <h1 id="pageTitle">Project Board</h1>
+                <input type="text" class="search" placeholder="Search issues..." id="search" oninput="handleSearch(this.value)">
+                <button class="btn" id="createBtn" onclick="openCreateModal()">+ New Issue</button>
+            </div>
+            <div class="metrics" id="metricsBar" style="display: none;">
+                <div class="metric">
+                    <div class="metric-value" id="totalIssues">0</div>
+                    <div class="metric-label">Total</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="inProgress">0</div>
+                    <div class="metric-label">In Progress</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="completed">0</div>
+                    <div class="metric-label">Completed</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="velocity">0</div>
+                    <div class="metric-label">Velocity</div>
+                </div>
             </div>
             <div class="board" id="board"></div>
+            <div id="metricsView" style="display: none; padding: 24px;">
+                <h2>Analytics</h2>
+                <p>Velocity metrics coming soon...</p>
+            </div>
         </div>
     </div>
+
+    <!-- Create Issue Modal -->
+    <div class="modal" id="createModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 class="modal-title">Create Issue</h2>
+                <button class="close-btn" onclick="closeCreateModal()">&times;</button>
+            </div>
+            <form onsubmit="handleCreate(event)">
+                <div class="form-group">
+                    <label>Title</label>
+                    <input type="text" id="issueTitle" required placeholder="Enter issue title">
+                </div>
+                <div class="form-group">
+                    <label>Description</label>
+                    <textarea id="issueDescription" rows="3" placeholder="Enter description"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Priority</label>
+                    <select id="issuePriority">
+                        <option value="4">Low</option>
+                        <option value="3" selected>Medium</option>
+                        <option value="2">High</option>
+                        <option value="1">Urgent</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Estimate (story points)</label>
+                    <input type="number" id="issueEstimate" min="0" value="0">
+                </div>
+                <div class="form-group">
+                    <label>Labels</label>
+                    <input type="text" id="issueLabels" placeholder="feature, bug (comma-separated)">
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" onclick="closeCreateModal()">Cancel</button>
+                    <button type="submit" class="btn">Create Issue</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
         var issues = [];
         var columns = ['backlog', 'todo', 'in_progress', 'done'];
+        var currentView = 'board';
+        var workspaceID = 'default';
 
         function getColumnColor(col) {
             var colors = { backlog: '#6B7280', todo: '#F59E0B', in_progress: '#3B82F6', done: '#10B981' };
             return colors[col] || '#6B7280';
         }
 
+        function getPriorityClass(priority) {
+            var classes = ['', 'urgent', 'high', 'medium', 'low'];
+            return classes[priority] || '';
+        }
+
         function renderIssue(issue) {
-            var priorityClass = ['', 'urgent', 'high', 'medium', 'low'][issue.priority] || '';
+            var priorityClass = getPriorityClass(issue.priority);
             var labelsHtml = '';
-            for (var i = 0; i < issue.labels.length; i++) {
-                labelsHtml += '<span class="label ' + issue.labels[i] + '">' + issue.labels[i] + '</span>';
+            if (issue.labels) {
+                for (var i = 0; i < issue.labels.length; i++) {
+                    labelsHtml += '<span class="label ' + issue.labels[i] + '">' + issue.labels[i] + '</span>';
+                }
             }
+            var pointsHtml = issue.estimate > 0 ? '<span style="color: #8B949E; font-size: 12px; margin-left: 8px;">' + issue.estimate + ' pts</span>' : '';
             return '<div class="issue" onclick="editIssue(\'' + issue.id + '\')">' +
                 '<div style="display: flex; align-items: flex-start;">' +
                 '<div class="priority ' + priorityClass + '"></div>' +
                 '<div>' +
-                '<div class="issue-title">' + issue.title + '</div>' +
+                '<div class="issue-title">' + issue.title + pointsHtml + '</div>' +
                 '<div class="issue-labels">' + labelsHtml + '</div>' +
                 '</div></div></div>';
         }
@@ -593,33 +718,79 @@ func webUIHTML() string {
 
         function loadIssues() {
             var xhr = new XMLHttpRequest();
-            xhr.open('GET', '/api/issues', true);
+            xhr.open('GET', '/api/issues?workspace_id=' + workspaceID, true);
             xhr.onreadystatechange = function() {
                 if (xhr.readyState === 4 && xhr.status === 200) {
                     issues = JSON.parse(xhr.responseText);
                     renderBoard();
+                    updateMetrics();
                 }
             };
             xhr.send();
         }
 
-        function createIssue() {
-            var title = prompt('Issue title:');
-            if (title) {
-                var xhr = new XMLHttpRequest();
-                xhr.open('POST', '/api/issues', true);
-                xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.onreadystatechange = function() {
-                    if (xhr.readyState === 4) loadIssues();
-                };
-                xhr.send(JSON.stringify({
-                    workspace_id: 'default',
-                    title: title,
-                    status: 'backlog',
-                    priority: 3,
-                    labels: []
-                }));
+        function updateMetrics() {
+            var counts = { backlog: 0, todo: 0, in_progress: 0, done: 0 };
+            var velocity = 0;
+            for (var i = 0; i < issues.length; i++) {
+                var status = issues[i].status;
+                if (counts.hasOwnProperty(status)) {
+                    counts[status]++;
+                }
+                if (issues[i].status === 'done' && issues[i].estimate) {
+                    velocity += issues[i].estimate;
+                }
             }
+            document.getElementById('totalIssues').textContent = issues.length;
+            document.getElementById('inProgress').textContent = counts.in_progress;
+            document.getElementById('completed').textContent = counts.done;
+            document.getElementById('velocity').textContent = velocity;
+        }
+
+        function openCreateModal() {
+            document.getElementById('createModal').classList.add('active');
+            document.getElementById('issueTitle').focus();
+        }
+
+        function closeCreateModal() {
+            document.getElementById('createModal').classList.remove('active');
+            document.getElementById('issueTitle').value = '';
+            document.getElementById('issueDescription').value = '';
+            document.getElementById('issueEstimate').value = '0';
+            document.getElementById('issueLabels').value = '';
+        }
+
+        function handleCreate(event) {
+            event.preventDefault();
+            var title = document.getElementById('issueTitle').value;
+            var description = document.getElementById('issueDescription').value;
+            var priority = parseInt(document.getElementById('issuePriority').value);
+            var estimate = parseInt(document.getElementById('issueEstimate').value) || 0;
+            var labelsStr = document.getElementById('issueLabels').value;
+            var labels = labelsStr ? labelsStr.split(',').map(function(l) { return l.trim(); }).filter(function(l) { return l; }) : [];
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/issues', true);
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4) {
+                    if (xhr.status === 200) {
+                        closeCreateModal();
+                        loadIssues();
+                    } else {
+                        alert('Failed to create issue');
+                    }
+                }
+            };
+            xhr.send(JSON.stringify({
+                workspace_id: workspaceID,
+                title: title,
+                description: description,
+                status: 'backlog',
+                priority: priority,
+                estimate: estimate,
+                labels: labels
+            }));
         }
 
         function editIssue(id) {
@@ -628,25 +799,162 @@ func webUIHTML() string {
                 if (issues[i].id === id) { issue = issues[i]; break; }
             }
             if (!issue) return;
-            var newStatus = prompt('New status (backlog, todo, in_progress, done):', issue.status);
+
+            var newStatus = prompt('Change status to (backlog, todo, in_progress, done):', issue.status);
             if (newStatus && columns.indexOf(newStatus) !== -1) {
                 var xhr = new XMLHttpRequest();
-                xhr.open('PUT', '/api/issues/' + id, true);
+                xhr.open('PATCH', '/api/issues/' + id, true);
                 xhr.setRequestHeader('Content-Type', 'application/json');
                 xhr.onreadystatechange = function() {
-                    if (xhr.readyState === 4) loadIssues();
+                    if (xhr.readyState === 4) {
+                        if (xhr.status === 200) {
+                            loadIssues();
+                        } else {
+                            alert('Failed to update issue');
+                        }
+                    }
                 };
                 xhr.send(JSON.stringify({ status: newStatus }));
             }
         }
 
-        document.getElementById('createBtn').addEventListener('click', createIssue);
-        document.getElementById('search').addEventListener('input', function(e) {
-            var query = e.target.value.toLowerCase();
-            // Filter is handled in loadIssues
+        function handleSearch(query) {
+            if (!query) {
+                renderBoard();
+                return;
+            }
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/search?q=' + encodeURIComponent(query) + '&workspace_id=' + workspaceID, true);
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4 && xhr.status === 200) {
+                    var results = JSON.parse(xhr.responseText);
+                    var board = document.getElementById('board');
+                    board.innerHTML = '<p style="color: #8B949E; padding: 24px;">Found ' + results.length + ' results</p>';
+                }
+            };
+            xhr.send();
+        }
+
+        function showBoard() {
+            currentView = 'board';
+            document.getElementById('board').style.display = 'flex';
+            document.getElementById('metricsBar').style.display = 'none';
+            document.getElementById('metricsView').style.display = 'none';
+            document.getElementById('pageTitle').textContent = 'Project Board';
+            document.querySelectorAll('.nav-item').forEach(function(el, i) {
+                el.classList.toggle('active', i === 0);
+            });
+            renderBoard();
+        }
+
+        function showMetrics() {
+            currentView = 'board';
+            document.getElementById('board').style.display = 'none';
+            document.getElementById('metricsBar').style.display = 'flex';
+            document.getElementById('metricsView').style.display = 'block';
+            document.getElementById('pageTitle').textContent = 'Analytics';
+            document.querySelectorAll('.nav-item').forEach(function(el, i) {
+                el.classList.toggle('active', i === 1);
+            });
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/metrics?workspace_id=' + workspaceID, true);
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4 && xhr.status === 200) {
+                    var metrics = JSON.parse(xhr.responseText);
+                    var html = '<h2 style="margin-bottom: 16px;">Velocity Metrics</h2>';
+                    html += '<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px;">';
+                    html += '<div style="background: #161B22; padding: 16px; border-radius: 8px;"><h3 style="color: #8B949E; font-size: 12px;">Completion Rate</h3><p style="font-size: 32px; font-weight: 600;">' + metrics.completion_rate.toFixed(1) + '%</p></div>';
+                    html += '<div style="background: #161B22; padding: 16px; border-radius: 8px;"><h3 style="color: #8B949E; font-size: 12px;">Total Points</h3><p style="font-size: 32px; font-weight: 600;">' + metrics.total_points + '</p></div>';
+                    html += '<div style="background: #161B22; padding: 16px; border-radius: 8px;"><h3 style="color: #8B949E; font-size: 12px;">Completed Points</h3><p style="font-size: 32px; font-weight: 600;">' + metrics.completed_points + '</p></div>';
+                    html += '<div style="background: #161B22; padding: 16px; border-radius: 8px;"><h3 style="color: #8B949E; font-size: 12px;">Bugs</h3><p style="font-size: 32px; font-weight: 600; color: #F85149;">' + metrics.bug_count + '</p></div>';
+                    html += '</div>';
+                    document.getElementById('metricsView').innerHTML = html;
+                }
+            };
+            xhr.send();
+        }
+
+        function showCycles() {
+            document.getElementById('board').style.display = 'none';
+            document.getElementById('metricsBar').style.display = 'none';
+            document.getElementById('metricsView').style.display = 'block';
+            document.getElementById('pageTitle').textContent = 'Cycles';
+            document.querySelectorAll('.nav-item').forEach(function(el, i) {
+                el.classList.toggle('active', i === 2);
+            });
+            document.getElementById('metricsView').innerHTML = '<h2 style="margin-bottom: 16px;">Cycles</h2><p style="color: #8B949E;">Cycle management coming soon...</p>';
+        }
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeCreateModal();
+            }
+            if (e.key === 'c' && !e.ctrlKey && !e.metaKey && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA') {
+                e.preventDefault();
+                openCreateModal();
+            }
         });
+
         loadIssues();
     </script>
 </body>
 </html>`
+}
+
+// Start starts the server
+func (s *Server) Start(ctx context.Context) error {
+	s.server = &http.Server{
+		Addr:    s.addr,
+		Handler: s.mux,
+	}
+
+	go func() {
+		fmt.Printf("Pulse server starting on %s\n", s.addr)
+		fmt.Printf("Database: %s\n", s.db.Path())
+		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("Server error: %v\n", err)
+		}
+	}()
+
+	<-ctx.Done()
+	return s.server.Shutdown(ctx)
+}
+
+// Close closes the server and database connection
+func (s *Server) Close() error {
+	return s.db.Close()
+}
+
+// Helper functions
+func defaultColumns() []Column {
+	return []Column{
+		{ID: "backlog", Name: "Backlog", Order: 0, Color: "#6B7280"},
+		{ID: "todo", Name: "To Do", Order: 1, Color: "#F59E0B"},
+		{ID: "in_progress", Name: "In Progress", Order: 2, Color: "#3B82F6"},
+		{ID: "done", Name: "Done", Order: 3, Color: "#10B981"},
+	}
+}
+
+func jsonResponse(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func contains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// Column represents a workflow column
+type Column struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Order int    `json:"order"`
+	Color string `json:"color"`
 }
