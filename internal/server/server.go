@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pulse/pm/internal/db"
@@ -483,26 +484,93 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
-	if query == "" {
-		jsonResponse(w, []interface{}{})
-		return
+	workspaceID := r.URL.Query().Get("workspace_id")
+	if workspaceID == "" {
+		workspaceID = "default"
 	}
 
-	workspaceID := r.URL.Query().Get("workspace_id")
+	// Parse filters from query
+	statusFilter := ""
+	labelFilter := ""
+	assigneeFilter := ""
+
+	// Handle filter prefixes: status:, label:, assignee:
+	if query != "" {
+		// Check for status: filter
+		if strings.HasPrefix(query, "status:") {
+			statusFilter = strings.TrimPrefix(query, "status:")
+			query = ""
+		} else if strings.HasPrefix(query, "label:") {
+			labelFilter = strings.TrimPrefix(query, "label:")
+			query = ""
+		} else if strings.HasPrefix(query, "assignee:") {
+			assigneeFilter = strings.TrimPrefix(query, "assignee:")
+			query = ""
+		}
+	}
+
+	// Also check individual query params
+	if statusFilter == "" {
+		statusFilter = r.URL.Query().Get("status")
+	}
+	if labelFilter == "" {
+		labelFilter = r.URL.Query().Get("label")
+	}
+	if assigneeFilter == "" {
+		assigneeFilter = r.URL.Query().Get("assignee")
+	}
+
+	// Get all issues for workspace
 	issues, err := s.issueRepo.List(workspaceID, "", 0, 0)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to search issues: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	// Filter issues
 	var results []interface{}
 	for _, issue := range issues {
-		if contains(issue.Title, query) || contains(issue.Description, query) {
+		matches := true
+
+		// Text search
+		if query != "" {
+			if !contains(issue.Title, query) && !contains(issue.Description, query) {
+				matches = false
+			}
+		}
+
+		// Status filter
+		if statusFilter != "" && issue.Status != statusFilter {
+			matches = false
+		}
+
+		// Label filter
+		if labelFilter != "" {
+			found := false
+			for _, l := range issue.Labels {
+				if contains(l, labelFilter) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				matches = false
+			}
+		}
+
+		// Assignee filter
+		if assigneeFilter != "" && issue.AssigneeID != assigneeFilter {
+			matches = false
+		}
+
+		if matches {
 			results = append(results, map[string]interface{}{
-				"type":    "issue",
-				"id":      issue.ID,
-				"title":   issue.Title,
-				"status":  issue.Status,
+				"type":      "issue",
+				"id":        issue.ID,
+				"title":     issue.Title,
+				"status":    issue.Status,
+				"labels":    issue.Labels,
+				"estimate":  issue.Estimate,
 				"workspace": workspaceID,
 			})
 		}
@@ -538,6 +606,8 @@ func webUIHTML() string {
         .btn { background: #238636; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; }
         .btn:hover { background: #2EA043; }
         .btn-secondary { background: #21262D; color: #ECEFF1; border: 1px solid #30363D; }
+        .btn-danger { background: #F85149; color: white; border: none; }
+        .btn-danger:hover { background: #DA3633; }
         .board { display: flex; padding: 24px; gap: 16px; overflow-x: auto; }
         .column { min-width: 280px; background: #0D1117; border-radius: 8px; padding: 12px; }
         .column-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -545,6 +615,7 @@ func webUIHTML() string {
         .column-count { background: #30363D; padding: 2px 8px; border-radius: 10px; font-size: 12px; color: #8B949E; }
         .issue { background: #161B22; border: 1px solid #30363D; border-radius: 6px; padding: 12px; margin-bottom: 8px; cursor: pointer; }
         .issue:hover { border-color: #58A6FF; }
+        .issue-id { font-size: 11px; color: #6E7681; font-family: monospace; margin-bottom: 4px; }
         .issue-title { font-size: 14px; margin-bottom: 8px; }
         .issue-labels { display: flex; gap: 4px; flex-wrap: wrap; }
         .label { font-size: 11px; padding: 2px 6px; border-radius: 4px; background: #30363D; }
@@ -557,21 +628,33 @@ func webUIHTML() string {
         .priority.low { background: #3FB950; }
         .search { background: #0D1117; border: 1px solid #30363D; padding: 8px 12px; border-radius: 6px; color: #ECEFF1; width: 240px; }
         .search:focus { outline: none; border-color: #58A6FF; }
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); align-items: center; justify-content: center; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); align-items: center; justify-content: center; z-index: 1000; }
         .modal.active { display: flex; }
-        .modal-content { background: #161B22; border-radius: 8px; padding: 24px; width: 500px; max-width: 90%; }
-        .modal-header { display: flex; justify-content: space-between; margin-bottom: 16px; }
+        .modal-content { background: #161B22; border-radius: 8px; padding: 24px; width: 600px; max-width: 95%; max-height: 90vh; overflow-y: auto; }
+        .modal-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
         .modal-title { font-size: 18px; font-weight: 600; }
         .close-btn { background: none; border: none; color: #8B949E; cursor: pointer; font-size: 20px; }
         .form-group { margin-bottom: 16px; }
         .form-group label { display: block; margin-bottom: 8px; font-size: 14px; color: #8B949E; }
         .form-group input, .form-group select, .form-group textarea { width: 100%; background: #0D1117; border: 1px solid #30363D; border-radius: 6px; padding: 8px 12px; color: #ECEFF1; font-size: 14px; }
         .form-group input:focus, .form-group select:focus, .form-group textarea:focus { outline: none; border-color: #58A6FF; }
-        .form-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
+        .form-actions { display: flex; justify-content: space-between; gap: 8px; margin-top: 24px; }
+        .form-actions-left { display: flex; gap: 8px; }
+        .form-actions-right { display: flex; gap: 8px; }
         .metrics { display: flex; gap: 24px; padding: 16px 24px; background: #161B22; border-bottom: 1px solid #30363D; }
         .metric { text-align: center; }
         .metric-value { font-size: 24px; font-weight: 600; color: #A371F7; }
         .metric-label { font-size: 12px; color: #8B949E; margin-top: 4px; }
+        .issue-meta { display: flex; gap: 16px; margin-top: 16px; padding-top: 16px; border-top: 1px solid #30363D; }
+        .meta-item { display: flex; flex-direction: column; gap: 4px; }
+        .meta-label { font-size: 12px; color: #8B949E; }
+        .meta-value { font-size: 14px; color: #ECEFF1; }
+        .status-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+        .status-backlog { background: #30363D; color: #8B949E; }
+        .status-todo { background: #F59E0B20; color: #F59E0B; }
+        .status-in_progress { background: #3B82F620; color: #3B82F6; }
+        .status-done { background: #10B98120; color: #10B981; }
+        .description-text { color: #8B949E; font-size: 14px; line-height: 1.6; margin-top: 8px; }
     </style>
 </head>
 <body>
@@ -657,6 +740,65 @@ func webUIHTML() string {
         </div>
     </div>
 
+    <!-- Issue Detail Modal -->
+    <div class="modal" id="detailModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div>
+                    <div class="issue-id" id="detailId">PLS-000</div>
+                    <h2 class="modal-title" id="detailTitle">Issue Title</h2>
+                </div>
+                <button class="close-btn" onclick="closeDetailModal()">&times;</button>
+            </div>
+
+            <div class="issue-meta">
+                <div class="meta-item">
+                    <span class="meta-label">Status</span>
+                    <span class="status-badge" id="detailStatus">backlog</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Priority</span>
+                    <span class="meta-value" id="detailPriority">Medium</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Estimate</span>
+                    <span class="meta-value" id="detailEstimate">0 pts</span>
+                </div>
+                <div class="meta-item">
+                    <span class="meta-label">Created</span>
+                    <span class="meta-value" id="detailCreated">-</span>
+                </div>
+            </div>
+
+            <div class="form-group" style="margin-top: 16px;">
+                <label>Description</label>
+                <p class="description-text" id="detailDescription">No description provided.</p>
+            </div>
+
+            <div class="form-group">
+                <label>Labels</label>
+                <div id="detailLabels"></div>
+            </div>
+
+            <div class="form-group">
+                <label>Change Status</label>
+                <select id="detailStatusSelect" onchange="updateDetailStatus()">
+                    <option value="backlog">Backlog</option>
+                    <option value="todo">To Do</option>
+                    <option value="in_progress">In Progress</option>
+                    <option value="done">Done</option>
+                </select>
+            </div>
+
+            <div class="form-actions">
+                <button class="btn btn-danger" onclick="deleteIssue()">Delete</button>
+                <div>
+                    <button class="btn btn-secondary" onclick="closeDetailModal()">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         var issues = [];
         var columns = ['backlog', 'todo', 'in_progress', 'done'];
@@ -682,7 +824,9 @@ func webUIHTML() string {
                 }
             }
             var pointsHtml = issue.estimate > 0 ? '<span style="color: #8B949E; font-size: 12px; margin-left: 8px;">' + issue.estimate + ' pts</span>' : '';
+            var shortId = 'PLS-' + issue.id.substring(issue.id.lastIndexOf('_') + 1).slice(-4);
             return '<div class="issue" onclick="editIssue(\'' + issue.id + '\')">' +
+                '<div class="issue-id">' + shortId + '</div>' +
                 '<div style="display: flex; align-items: flex-start;">' +
                 '<div class="priority ' + priorityClass + '"></div>' +
                 '<div>' +
@@ -793,29 +937,98 @@ func webUIHTML() string {
             }));
         }
 
-        function editIssue(id) {
+        var currentDetailId = null;
+
+        function openDetailModal(id) {
             var issue = null;
             for (var i = 0; i < issues.length; i++) {
                 if (issues[i].id === id) { issue = issues[i]; break; }
             }
             if (!issue) return;
 
-            var newStatus = prompt('Change status to (backlog, todo, in_progress, done):', issue.status);
-            if (newStatus && columns.indexOf(newStatus) !== -1) {
-                var xhr = new XMLHttpRequest();
-                xhr.open('PATCH', '/api/issues/' + id, true);
-                xhr.setRequestHeader('Content-Type', 'application/json');
-                xhr.onreadystatechange = function() {
-                    if (xhr.readyState === 4) {
-                        if (xhr.status === 200) {
-                            loadIssues();
-                        } else {
-                            alert('Failed to update issue');
-                        }
-                    }
-                };
-                xhr.send(JSON.stringify({ status: newStatus }));
+            currentDetailId = id;
+
+            // Generate short ID (PLS-XXX format)
+            var shortId = 'PLS-' + id.substring(id.lastIndexOf('_') + 1).slice(-4);
+
+            document.getElementById('detailId').textContent = shortId;
+            document.getElementById('detailTitle').textContent = issue.title;
+            document.getElementById('detailStatus').textContent = issue.status.replace(/_/g, ' ');
+            document.getElementById('detailStatus').className = 'status-badge status-' + issue.status;
+
+            var priorityNames = ['', 'Urgent', 'High', 'Medium', 'Low'];
+            document.getElementById('detailPriority').textContent = priorityNames[issue.priority] || 'Medium';
+
+            document.getElementById('detailEstimate').textContent = (issue.estimate || 0) + ' pts';
+
+            var created = new Date(issue.created_at);
+            document.getElementElementById('detailCreated').textContent = created.toLocaleDateString();
+
+            document.getElementById('detailDescription').textContent = issue.description || 'No description provided.';
+
+            // Labels
+            var labelsHtml = '';
+            if (issue.labels && issue.labels.length > 0) {
+                for (var j = 0; j < issue.labels.length; j++) {
+                    labelsHtml += '<span class="label ' + issue.labels[j] + '">' + issue.labels[j] + '</span>';
+                }
+            } else {
+                labelsHtml = '<span style="color: #6E7681;">No labels</span>';
             }
+            document.getElementById('detailLabels').innerHTML = labelsHtml;
+
+            // Status select
+            document.getElementById('detailStatusSelect').value = issue.status;
+
+            document.getElementById('detailModal').classList.add('active');
+        }
+
+        function closeDetailModal() {
+            document.getElementById('detailModal').classList.remove('active');
+            currentDetailId = null;
+        }
+
+        function updateDetailStatus() {
+            var newStatus = document.getElementById('detailStatusSelect').value;
+            if (!currentDetailId) return;
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('PATCH', '/api/issues/' + currentDetailId, true);
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4) {
+                    if (xhr.status === 200) {
+                        closeDetailModal();
+                        loadIssues();
+                    } else {
+                        alert('Failed to update issue');
+                    }
+                }
+            };
+            xhr.send(JSON.stringify({ status: newStatus }));
+        }
+
+        function deleteIssue() {
+            if (!currentDetailId) return;
+            if (!confirm('Are you sure you want to delete this issue?')) return;
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('DELETE', '/api/issues/' + currentDetailId, true);
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4) {
+                    if (xhr.status === 204 || xhr.status === 200) {
+                        closeDetailModal();
+                        loadIssues();
+                    } else {
+                        alert('Failed to delete issue');
+                    }
+                }
+            };
+            xhr.send();
+        }
+
+        function editIssue(id) {
+            openDetailModal(id);
         }
 
         function handleSearch(query) {
@@ -829,7 +1042,43 @@ func webUIHTML() string {
                 if (xhr.readyState === 4 && xhr.status === 200) {
                     var results = JSON.parse(xhr.responseText);
                     var board = document.getElementById('board');
-                    board.innerHTML = '<p style="color: #8B949E; padding: 24px;">Found ' + results.length + ' results</p>';
+                    if (results.length === 0) {
+                        board.innerHTML = '<p style="color: #8B949E; padding: 24px;">No issues found matching "' + query + '"</p>';
+                        return;
+                    }
+                    // Render results as a filtered board
+                    board.innerHTML = '';
+                    var columnsHtml = '';
+                    for (var i = 0; i < columns.length; i++) {
+                        var col = columns[i];
+                        var colResults = [];
+                        for (var j = 0; j < results.length; j++) {
+                            if (results[j].status === col) colResults.push(results[j]);
+                        }
+                        columnsHtml += '<div class="column">' +
+                            '<div class="column-header">' +
+                            '<div class="column-title">' +
+                            '<span style="color:' + getColumnColor(col) + '">●</span>' +
+                            col.replace(/_/g, ' ') +
+                            '<span class="column-count">' + colResults.length + '</span>' +
+                            '</div></div>';
+                        for (var k = 0; k < colResults.length; k++) {
+                            var result = colResults[k];
+                            var labelsHtml = '';
+                            if (result.labels) {
+                                for (var l = 0; l < result.labels.length; l++) {
+                                    labelsHtml += '<span class="label ' + result.labels[l] + '">' + result.labels[l] + '</span>';
+                                }
+                            }
+                            var pointsHtml = result.estimate > 0 ? '<span style="color: #8B949E; font-size: 12px; margin-left: 8px;">' + result.estimate + ' pts</span>' : '';
+                            columnsHtml += '<div class="issue" onclick="editIssue(\'' + result.id + '\')">' +
+                                '<div class="issue-title">' + result.title + pointsHtml + '</div>' +
+                                '<div class="issue-labels">' + labelsHtml + '</div>' +
+                                '</div>';
+                        }
+                        columnsHtml += '</div>';
+                    }
+                    board.innerHTML = columnsHtml;
                 }
             };
             xhr.send();
